@@ -17,3 +17,5 @@ coverage*.out
 
 GoBuilds
 dist
+
+*.log

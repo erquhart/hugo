@@ -25,7 +25,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	"github.com/gohugoio/hugo/livereload"
@@ -361,9 +360,6 @@ func (c *commandeer) serve() error {
 	if doLiveReload {
 		livereload.Initialize()
 	}
-
-	var sigs = make(chan os.Signal)
-	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
 
 	for i := range baseURLs {
 		mu, serverURL, endpoint, err := srv.createEndpoint(i)

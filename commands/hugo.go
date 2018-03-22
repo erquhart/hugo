@@ -21,7 +21,6 @@ import (
 	"os/signal"
 	"sort"
 	"sync/atomic"
-	"syscall"
 
 	"golang.org/x/sync/errgroup"
 
@@ -41,7 +40,6 @@ import (
 
 	"regexp"
 
-	"github.com/fsnotify/fsnotify"
 	"github.com/gohugoio/hugo/helpers"
 	"github.com/gohugoio/hugo/hugolib"
 	"github.com/gohugoio/hugo/livereload"
@@ -53,6 +51,8 @@ import (
 	jww "github.com/spf13/jwalterweatherman"
 	"github.com/spf13/nitro"
 )
+
+println("test")
 
 // Hugo represents the Hugo sites to build. This variable is exported as it
 // is used by at least one external library (the Hugo caddy plugin). We should
@@ -487,9 +487,6 @@ func (c *commandeer) build() error {
 		utils.CheckErr(c.Logger, err)
 		defer watcher.Close()
 
-		var sigs = make(chan os.Signal)
-		signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
-
 		<-sigs
 	}
 
@@ -823,7 +820,7 @@ func (c *commandeer) buildSites() (err error) {
 	return Hugo.Build(hugolib.BuildCfg{})
 }
 
-func (c *commandeer) rebuildSites(events []fsnotify.Event) error {
+func (c *commandeer) rebuildSites() error {
 	defer c.timeTrack(time.Now(), "Total")
 
 	if err := c.initSites(); err != nil {
@@ -845,254 +842,6 @@ func (c *commandeer) rebuildSites(events []fsnotify.Event) error {
 
 	}
 	return Hugo.Build(hugolib.BuildCfg{RecentlyVisited: visited}, events...)
-}
-
-// newWatcher creates a new watcher to watch filesystem events.
-func (c *commandeer) newWatcher(dirList ...string) (*watcher.Batcher, error) {
-	if runtime.GOOS == "darwin" {
-		tweakLimit()
-	}
-
-	staticSyncer, err := newStaticSyncer(c)
-	if err != nil {
-		return nil, err
-	}
-
-	watcher, err := watcher.New(1 * time.Second)
-
-	if err != nil {
-		return nil, err
-	}
-
-	for _, d := range dirList {
-		if d != "" {
-			_ = watcher.Add(d)
-		}
-	}
-
-	// Identifies changes to config (config.toml) files.
-	configSet := make(map[string]bool)
-
-	for _, configFile := range c.configFiles {
-		c.Logger.FEEDBACK.Println("Watching for config changes in", configFile)
-		watcher.Add(configFile)
-		configSet[configFile] = true
-	}
-
-	go func() {
-		for {
-			select {
-			case evs := <-watcher.Events:
-				c.Logger.INFO.Println("Received System Events:", evs)
-
-				staticEvents := []fsnotify.Event{}
-				dynamicEvents := []fsnotify.Event{}
-
-				// Special handling for symbolic links inside /content.
-				filtered := []fsnotify.Event{}
-				for _, ev := range evs {
-					if configSet[ev.Name] {
-						if ev.Op&fsnotify.Chmod == fsnotify.Chmod {
-							continue
-						}
-						// Config file changed. Need full rebuild.
-						if err := c.loadConfig(true); err != nil {
-							jww.ERROR.Println("Failed to reload config:", err)
-						} else if err := c.recreateAndBuildSites(true); err != nil {
-							jww.ERROR.Println(err)
-						} else if !buildWatch && !c.Cfg.GetBool("disableLiveReload") {
-							livereload.ForceRefresh()
-						}
-						break
-					}
-
-					// Check the most specific first, i.e. files.
-					contentMapped := Hugo.ContentChanges.GetSymbolicLinkMappings(ev.Name)
-					if len(contentMapped) > 0 {
-						for _, mapped := range contentMapped {
-							filtered = append(filtered, fsnotify.Event{Name: mapped, Op: ev.Op})
-						}
-						continue
-					}
-
-					// Check for any symbolic directory mapping.
-
-					dir, name := filepath.Split(ev.Name)
-
-					contentMapped = Hugo.ContentChanges.GetSymbolicLinkMappings(dir)
-
-					if len(contentMapped) == 0 {
-						filtered = append(filtered, ev)
-						continue
-					}
-
-					for _, mapped := range contentMapped {
-						mappedFilename := filepath.Join(mapped, name)
-						filtered = append(filtered, fsnotify.Event{Name: mappedFilename, Op: ev.Op})
-					}
-				}
-
-				evs = filtered
-
-				for _, ev := range evs {
-					ext := filepath.Ext(ev.Name)
-					baseName := filepath.Base(ev.Name)
-					istemp := strings.HasSuffix(ext, "~") ||
-						(ext == ".swp") || // vim
-						(ext == ".swx") || // vim
-						(ext == ".tmp") || // generic temp file
-						(ext == ".DS_Store") || // OSX Thumbnail
-						baseName == "4913" || // vim
-						strings.HasPrefix(ext, ".goutputstream") || // gnome
-						strings.HasSuffix(ext, "jb_old___") || // intelliJ
-						strings.HasSuffix(ext, "jb_tmp___") || // intelliJ
-						strings.HasSuffix(ext, "jb_bak___") || // intelliJ
-						strings.HasPrefix(ext, ".sb-") || // byword
-						strings.HasPrefix(baseName, ".#") || // emacs
-						strings.HasPrefix(baseName, "#") // emacs
-					if istemp {
-						continue
-					}
-					// Sometimes during rm -rf operations a '"": REMOVE' is triggered. Just ignore these
-					if ev.Name == "" {
-						continue
-					}
-
-					// Write and rename operations are often followed by CHMOD.
-					// There may be valid use cases for rebuilding the site on CHMOD,
-					// but that will require more complex logic than this simple conditional.
-					// On OS X this seems to be related to Spotlight, see:
-					// https://github.com/go-fsnotify/fsnotify/issues/15
-					// A workaround is to put your site(s) on the Spotlight exception list,
-					// but that may be a little mysterious for most end users.
-					// So, for now, we skip reload on CHMOD.
-					// We do have to check for WRITE though. On slower laptops a Chmod
-					// could be aggregated with other important events, and we still want
-					// to rebuild on those
-					if ev.Op&(fsnotify.Chmod|fsnotify.Write|fsnotify.Create) == fsnotify.Chmod {
-						continue
-					}
-
-					walkAdder := func(path string, f os.FileInfo, err error) error {
-						if f.IsDir() {
-							c.Logger.FEEDBACK.Println("adding created directory to watchlist", path)
-							if err := watcher.Add(path); err != nil {
-								return err
-							}
-						} else if !staticSyncer.isStatic(path) {
-							// Hugo's rebuilding logic is entirely file based. When you drop a new folder into
-							// /content on OSX, the above logic will handle future watching of those files,
-							// but the initial CREATE is lost.
-							dynamicEvents = append(dynamicEvents, fsnotify.Event{Name: path, Op: fsnotify.Create})
-						}
-						return nil
-					}
-
-					// recursively add new directories to watch list
-					// When mkdir -p is used, only the top directory triggers an event (at least on OSX)
-					if ev.Op&fsnotify.Create == fsnotify.Create {
-						if s, err := c.Fs.Source.Stat(ev.Name); err == nil && s.Mode().IsDir() {
-							_ = helpers.SymbolicWalk(c.Fs.Source, ev.Name, walkAdder)
-						}
-					}
-
-					if staticSyncer.isStatic(ev.Name) {
-						staticEvents = append(staticEvents, ev)
-					} else {
-						dynamicEvents = append(dynamicEvents, ev)
-					}
-				}
-
-				if len(staticEvents) > 0 {
-					c.Logger.FEEDBACK.Println("\nStatic file changes detected")
-					const layout = "2006-01-02 15:04:05.000 -0700"
-					c.Logger.FEEDBACK.Println(time.Now().Format(layout))
-
-					if c.Cfg.GetBool("forceSyncStatic") {
-						c.Logger.FEEDBACK.Printf("Syncing all static files\n")
-						_, err := c.copyStatic()
-						if err != nil {
-							utils.StopOnErr(c.Logger, err, "Error copying static files to publish dir")
-						}
-					} else {
-						if err := staticSyncer.syncsStaticEvents(staticEvents); err != nil {
-							c.Logger.ERROR.Println(err)
-							continue
-						}
-					}
-
-					if !buildWatch && !c.Cfg.GetBool("disableLiveReload") {
-						// Will block forever trying to write to a channel that nobody is reading if livereload isn't initialized
-
-						// force refresh when more than one file
-						if len(staticEvents) > 0 {
-							for _, ev := range staticEvents {
-								path := staticSyncer.d.MakeStaticPathRelative(ev.Name)
-								livereload.RefreshPath(path)
-							}
-
-						} else {
-							livereload.ForceRefresh()
-						}
-					}
-				}
-
-				if len(dynamicEvents) > 0 {
-					doLiveReload := !buildWatch && !c.Cfg.GetBool("disableLiveReload")
-					onePageName := pickOneWriteOrCreatePath(dynamicEvents)
-
-					c.Logger.FEEDBACK.Println("\nChange detected, rebuilding site")
-					const layout = "2006-01-02 15:04:05.000 -0700"
-					c.Logger.FEEDBACK.Println(time.Now().Format(layout))
-
-					if err := c.rebuildSites(dynamicEvents); err != nil {
-						c.Logger.ERROR.Println("Failed to rebuild site:", err)
-					}
-
-					if doLiveReload {
-						navigate := c.Cfg.GetBool("navigateToChanged")
-						// We have fetched the same page above, but it may have
-						// changed.
-						var p *hugolib.Page
-
-						if navigate {
-							if onePageName != "" {
-								p = Hugo.GetContentPage(onePageName)
-							}
-
-						}
-
-						if p != nil {
-							livereload.NavigateToPathForPort(p.RelPermalink(), p.Site.ServerPort())
-						} else {
-							livereload.ForceRefresh()
-						}
-					}
-				}
-			case err := <-watcher.Errors:
-				if err != nil {
-					c.Logger.ERROR.Println(err)
-				}
-			}
-		}
-	}()
-
-	return watcher, nil
-}
-
-func pickOneWriteOrCreatePath(events []fsnotify.Event) string {
-	name := ""
-
-	// Some editors (for example notepad.exe on Windows) triggers a change
-	// both for directory and file. So we pick the longest path, which should
-	// be the file itself.
-	for _, ev := range events {
-		if (ev.Op&fsnotify.Write == fsnotify.Write || ev.Op&fsnotify.Create == fsnotify.Create) && len(ev.Name) > len(name) {
-			name = ev.Name
-		}
-	}
-
-	return name
 }
 
 // isThemeVsHugoVersionMismatch returns whether the current Hugo version is

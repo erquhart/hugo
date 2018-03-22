@@ -38,7 +38,6 @@ import (
 	"github.com/markbates/inflect"
 	"golang.org/x/net/context"
 
-	"github.com/fsnotify/fsnotify"
 	bp "github.com/gohugoio/hugo/bufferpool"
 	"github.com/gohugoio/hugo/deps"
 	"github.com/gohugoio/hugo/helpers"
@@ -571,225 +570,6 @@ func (s *Site) RegisterMediaTypes() {
 	}
 }
 
-func (s *Site) filterFileEvents(events []fsnotify.Event) []fsnotify.Event {
-	var filtered []fsnotify.Event
-	seen := make(map[fsnotify.Event]bool)
-
-	for _, ev := range events {
-		// Avoid processing the same event twice.
-		if seen[ev] {
-			continue
-		}
-		seen[ev] = true
-
-		if s.SourceSpec.IgnoreFile(ev.Name) {
-			continue
-		}
-
-		// Throw away any directories
-		isRegular, err := s.SourceSpec.IsRegularSourceFile(ev.Name)
-		if err != nil && os.IsNotExist(err) && (ev.Op&fsnotify.Remove == fsnotify.Remove || ev.Op&fsnotify.Rename == fsnotify.Rename) {
-			// Force keep of event
-			isRegular = true
-		}
-		if !isRegular {
-			continue
-		}
-
-		filtered = append(filtered, ev)
-	}
-
-	return filtered
-}
-
-func (s *Site) translateFileEvents(events []fsnotify.Event) []fsnotify.Event {
-	var filtered []fsnotify.Event
-
-	eventMap := make(map[string][]fsnotify.Event)
-
-	// We often get a Remove etc. followed by a Create, a Create followed by a Write.
-	// Remove the superflous events to mage the update logic simpler.
-	for _, ev := range events {
-		eventMap[ev.Name] = append(eventMap[ev.Name], ev)
-	}
-
-	for _, ev := range events {
-		mapped := eventMap[ev.Name]
-
-		// Keep one
-		found := false
-		var kept fsnotify.Event
-		for i, ev2 := range mapped {
-			if i == 0 {
-				kept = ev2
-			}
-
-			if ev2.Op&fsnotify.Write == fsnotify.Write {
-				kept = ev2
-				found = true
-			}
-
-			if !found && ev2.Op&fsnotify.Create == fsnotify.Create {
-				kept = ev2
-			}
-		}
-
-		filtered = append(filtered, kept)
-	}
-
-	return filtered
-}
-
-// reBuild partially rebuilds a site given the filesystem events.
-// It returns whetever the content source was changed.
-// TODO(bep) clean up/rewrite this method.
-func (s *Site) processPartial(events []fsnotify.Event) (whatChanged, error) {
-
-	events = s.filterFileEvents(events)
-	events = s.translateFileEvents(events)
-
-	s.Log.DEBUG.Printf("Rebuild for events %q", events)
-
-	h := s.owner
-
-	s.timerStep("initialize rebuild")
-
-	// First we need to determine what changed
-
-	var (
-		sourceChanged       = []fsnotify.Event{}
-		sourceReallyChanged = []fsnotify.Event{}
-		contentFilesChanged []string
-		tmplChanged         = []fsnotify.Event{}
-		dataChanged         = []fsnotify.Event{}
-		i18nChanged         = []fsnotify.Event{}
-		shortcodesChanged   = make(map[string]bool)
-		sourceFilesChanged  = make(map[string]bool)
-
-		// prevent spamming the log on changes
-		logger = helpers.NewDistinctFeedbackLogger()
-	)
-
-	for _, ev := range events {
-		if s.isContentDirEvent(ev) {
-			logger.Println("Source changed", ev)
-			sourceChanged = append(sourceChanged, ev)
-		}
-		if s.isLayoutDirEvent(ev) {
-			logger.Println("Template changed", ev)
-			tmplChanged = append(tmplChanged, ev)
-
-			if strings.Contains(ev.Name, "shortcodes") {
-				clearIsInnerShortcodeCache()
-				shortcode := filepath.Base(ev.Name)
-				shortcode = strings.TrimSuffix(shortcode, filepath.Ext(shortcode))
-				shortcodesChanged[shortcode] = true
-			}
-		}
-		if s.isDataDirEvent(ev) {
-			logger.Println("Data changed", ev)
-			dataChanged = append(dataChanged, ev)
-		}
-		if s.isI18nEvent(ev) {
-			logger.Println("i18n changed", ev)
-			i18nChanged = append(dataChanged, ev)
-		}
-	}
-
-	if len(tmplChanged) > 0 || len(i18nChanged) > 0 {
-		sites := s.owner.Sites
-		first := sites[0]
-
-		// TOD(bep) globals clean
-		if err := first.Deps.LoadResources(); err != nil {
-			s.Log.ERROR.Println(err)
-		}
-
-		s.TemplateHandler().PrintErrors()
-
-		for i := 1; i < len(sites); i++ {
-			site := sites[i]
-			var err error
-			site.Deps, err = first.Deps.ForLanguage(site.Language)
-			if err != nil {
-				return whatChanged{}, err
-			}
-		}
-
-		s.timerStep("template prep")
-	}
-
-	if len(dataChanged) > 0 {
-		if err := s.readDataFromSourceFS(); err != nil {
-			s.Log.ERROR.Println(err)
-		}
-	}
-
-	for _, ev := range sourceChanged {
-		removed := false
-
-		if ev.Op&fsnotify.Remove == fsnotify.Remove {
-			removed = true
-		}
-
-		// Some editors (Vim) sometimes issue only a Rename operation when writing an existing file
-		// Sometimes a rename operation means that file has been renamed other times it means
-		// it's been updated
-		if ev.Op&fsnotify.Rename == fsnotify.Rename {
-			// If the file is still on disk, it's only been updated, if it's not, it's been moved
-			if ex, err := afero.Exists(s.Fs.Source, ev.Name); !ex || err != nil {
-				removed = true
-			}
-		}
-		if removed && isContentFile(ev.Name) {
-			path, _ := helpers.GetRelativePath(ev.Name, s.getContentDir(ev.Name))
-
-			h.removePageByPath(path)
-		}
-
-		sourceReallyChanged = append(sourceReallyChanged, ev)
-		sourceFilesChanged[ev.Name] = true
-	}
-
-	for shortcode := range shortcodesChanged {
-		// There are certain scenarios that, when a shortcode changes,
-		// it isn't sufficient to just rerender the already parsed shortcode.
-		// One example is if the user adds a new shortcode to the content file first,
-		// and then creates the shortcode on the file system.
-		// To handle these scenarios, we must do a full reprocessing of the
-		// pages that keeps a reference to the changed shortcode.
-		pagesWithShortcode := h.findPagesByShortcode(shortcode)
-		for _, p := range pagesWithShortcode {
-			contentFilesChanged = append(contentFilesChanged, p.File.Filename())
-		}
-	}
-
-	if len(sourceReallyChanged) > 0 || len(contentFilesChanged) > 0 {
-		var filenamesChanged []string
-		for _, e := range sourceReallyChanged {
-			filenamesChanged = append(filenamesChanged, e.Name)
-		}
-		if len(contentFilesChanged) > 0 {
-			filenamesChanged = append(filenamesChanged, contentFilesChanged...)
-		}
-
-		filenamesChanged = helpers.UniqueStrings(filenamesChanged)
-
-		if err := s.readAndProcessContent(filenamesChanged...); err != nil {
-			return whatChanged{}, err
-		}
-	}
-
-	changed := whatChanged{
-		source: len(sourceChanged) > 0,
-		other:  len(tmplChanged) > 0 || len(i18nChanged) > 0 || len(dataChanged) > 0,
-		files:  sourceFilesChanged,
-	}
-
-	return changed, nil
-
-}
-
 func (s *Site) loadData(sourceDirs []string) (err error) {
 	s.Log.DEBUG.Printf("Load Data from %d source(s)", len(sourceDirs))
 	s.Data = make(map[string]interface{})
@@ -1160,13 +940,6 @@ func (s *Site) absI18nDir() string {
 	return s.PathSpec.AbsPathify(s.i18nDir())
 }
 
-func (s *Site) isI18nEvent(e fsnotify.Event) bool {
-	if s.getI18nDir(e.Name) != "" {
-		return true
-	}
-	return s.getThemeI18nDir(e.Name) != ""
-}
-
 func (s *Site) getI18nDir(path string) string {
 	return s.getRealDir(s.absI18nDir(), path)
 }
@@ -1176,13 +949,6 @@ func (s *Site) getThemeI18nDir(path string) string {
 		return ""
 	}
 	return s.getRealDir(filepath.Join(s.PathSpec.GetThemeDir(), s.i18nDir()), path)
-}
-
-func (s *Site) isDataDirEvent(e fsnotify.Event) bool {
-	if s.getDataDir(e.Name) != "" {
-		return true
-	}
-	return s.getThemeDataDir(e.Name) != ""
 }
 
 func (s *Site) getDataDir(path string) string {
@@ -1200,13 +966,6 @@ func (s *Site) layoutDir() string {
 	return s.Cfg.GetString("layoutDir")
 }
 
-func (s *Site) isLayoutDirEvent(e fsnotify.Event) bool {
-	if s.getLayoutDir(e.Name) != "" {
-		return true
-	}
-	return s.getThemeLayoutDir(e.Name) != ""
-}
-
 func (s *Site) getLayoutDir(path string) string {
 	return s.getRealDir(s.PathSpec.GetLayoutDirPath(), path)
 }
@@ -1220,10 +979,6 @@ func (s *Site) getThemeLayoutDir(path string) string {
 
 func (s *Site) absContentDir() string {
 	return s.PathSpec.AbsPathify(s.PathSpec.ContentDir())
-}
-
-func (s *Site) isContentDirEvent(e fsnotify.Event) bool {
-	return s.getContentDir(e.Name) != ""
 }
 
 func (s *Site) getContentDir(path string) string {

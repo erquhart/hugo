@@ -21,13 +21,12 @@ import (
 
 	jww "github.com/spf13/jwalterweatherman"
 
-	"github.com/fsnotify/fsnotify"
 	"github.com/gohugoio/hugo/helpers"
 )
 
 // Build builds all sites. If filesystem events are provided,
 // this is considered to be a potential partial rebuild.
-func (h *HugoSites) Build(config BuildCfg, events ...fsnotify.Event) error {
+func (h *HugoSites) Build(config BuildCfg) error {
 	if h.Metrics != nil {
 		h.Metrics.Reset()
 	}
@@ -42,18 +41,7 @@ func (h *HugoSites) Build(config BuildCfg, events ...fsnotify.Event) error {
 		conf.whatChanged = &whatChanged{source: true, other: true}
 	}
 
-	if len(events) > 0 {
-		// Rebuild
-		if err := h.initRebuild(conf); err != nil {
-			return err
-		}
-	} else {
-		if err := h.init(conf); err != nil {
-			return err
-		}
-	}
-
-	if err := h.process(conf, events...); err != nil {
+	if err := h.process(conf); err != nil {
 		return err
 	}
 
@@ -136,20 +124,13 @@ func (h *HugoSites) initRebuild(config *BuildCfg) error {
 	return nil
 }
 
-func (h *HugoSites) process(config *BuildCfg, events ...fsnotify.Event) error {
+func (h *HugoSites) process(config *BuildCfg) error {
 	// We should probably refactor the Site and pull up most of the logic from there to here,
 	// but that seems like a daunting task.
 	// So for now, if there are more than one site (language),
 	// we pre-process the first one, then configure all the sites based on that.
 
 	firstSite := h.Sites[0]
-
-	if len(events) > 0 {
-		// This is a rebuild
-		changed, err := firstSite.processPartial(events)
-		config.whatChanged = &changed
-		return err
-	}
 
 	return firstSite.process(*config)
 
